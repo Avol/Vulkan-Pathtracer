@@ -1,0 +1,746 @@
+#version 450
+
+// allows to use defines
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// enums for surfaces
+const uint          SOLID                                   = 0x00000001u;
+const uint          TRANSLUCENT                             = 0x00000002u;
+const uint          REFLECTIVE                              = 0x00000004u;
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------------- DEFINITIONS -------------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+#define         PI                                       3.1415926535897932384626433832795
+#define         PI2                                      6.283185307179586
+#define         RADIAN                                   0.0174533
+
+#define         FRAME_COUNT                              1000
+#define         FRAME_PROGRESSION                        1.0f
+#define         BOUNCE_COUNT							 2
+#define         RAY_COUNT								 4                                              // 4 to 8 is enough.
+#define         BIAS									 0.001f
+
+// notice: this should be defined before shader is compiled
+//         the recalculation of this is needed, since using uniform count introduces significant decrease in performance.
+//         SBO's would likely solve this problem with ease.
+#define         PLANE_COUNT                              6
+#define         SPHERE_COUNT                             4
+
+#define         CAUSTICS                                 true
+#define         REFRACTION_ETA                           0.71428571428
+#define         MAX_BOUNCE_PER_TRACE                     5
+
+#define         INDIRECT_INTENSITY				         4.0f
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------------- STRUCTS -------------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+struct Ray 
+{
+	vec3 origin;
+	vec3 direction;
+};
+
+struct Light
+{
+    int   type;
+	vec3  direction;
+	vec3  position;
+	float radius;
+	vec3  color;
+	float constantAttenuation;
+	float linearAttenuation;
+    float quadraticAttenuation;
+};
+
+struct Intersection
+{
+    uint type;
+    vec3 point;
+    vec3 normal;
+    vec3 reflection;
+	vec3 refraction;
+    float range;
+    vec4 albedo;
+	vec4 specular;
+	vec4 redf;
+};
+
+struct Plane
+{
+	vec4 normal;
+	vec4 position;
+	vec4 albedo;
+	vec4 specular;
+	vec4 redf;
+};
+
+struct Sphere
+{
+	vec4 position;
+	vec4 albedo;
+	vec4 specular;
+	vec4 redf;
+};
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ------------------------------------------------------ Uniforms -------------------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+layout (binding = 0, rgba8) uniform image2D inputImage;
+layout (binding = 1, rgba8) uniform image2D resultImage;
+
+
+layout(binding = 2) uniform Data
+{
+	mat4    inverse_projection_view;
+    vec2    resolution;
+	int     frame;
+    float   time;
+} data;
+
+layout(std140, binding = 3) uniform LightData
+{
+	vec4  position;
+    vec4  color;
+    vec4  direction;
+	float radius;
+	float constantAttenuation;
+	float linearAttenuation;
+    float quadraticAttenuation;
+    int   type;
+} _light;
+
+layout(binding = 4) uniform PlaneData
+{
+	Plane planes[ PLANE_COUNT ];
+} _planes;
+
+layout(binding = 5) uniform SphereData
+{
+	Sphere spheres[ SPHERE_COUNT ];
+} _spheres;
+
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ------------------------------------------------------ Helper Functions --------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+// Transforms camera local coordinate to world space position.
+// @ m = inverse projection matrix of the camera.
+vec3 screenToWorld(mat4x4 m, vec3 v)
+{
+	vec3 sPoint	    = v * 2.0f - 1.0f;
+
+	vec4 wPoint	    = m * vec4(sPoint, 1.0f);
+	wPoint			/= wPoint.w;
+
+	return wPoint.xyz;
+}
+
+float random(vec3 scale, float seed, vec3 pixelSeed)
+{
+    return fract( sin( dot(pixelSeed + vec3(seed), scale) ) * 43758.5453f + seed );
+}
+
+float Hash( float n )
+{
+    return fract( sin(n) * 43758.5453123 );
+}
+
+
+vec3 CosineDirection( float seed, vec3 normal, vec3 pixelSeed, Intersection intersection, out float pdf )
+{
+    float Xi1 = random(vec3(12.9898, 78.233, 151.7182), seed, pixelSeed);
+    float Xi2 = random(vec3(63.7264, 10.873, 623.6736), seed, pixelSeed);
+
+	// phong importnce smpling.
+	float power = 16.0f * (1.0f - intersection.redf.r);
+	power *= power;
+
+    float theta = acos(pow(Xi1, 1.0f/(power+1.0f)));              // phong
+	//float theta = acos(sqrt(1.0-Xi1));                          // lmbertin
+
+    float phi = 2.0 * PI * Xi2;
+
+    float xs = sin(theta) * cos(phi);
+    float ys = cos(theta);
+    float zs = sin(theta) * sin(phi);
+
+    vec3 y = normal;
+    vec3 h = y;
+    if (abs(h.x)<=abs(h.y) && abs(h.x)<=abs(h.z))
+        h.x= 1.0;
+    else if (abs(h.y)<=abs(h.x) && abs(h.y)<=abs(h.z))
+        h.y= 1.0;
+    else
+        h.z= 1.0;
+
+    vec3 x = normalize( cross(h, y) );
+    vec3 z = normalize( cross(x, y) );
+
+	// lmbertin
+    //vec3 direction = xs * x + ys * y + zs * z;
+
+	// phong
+	vec3 direction = cos(phi)*sin(theta)*x
+        + sin(phi)*sin(theta)*z
+        + cos(theta)*intersection.reflection;
+  //  vec3 direction2 = result;
+
+    pdf = pow(Xi1, 1.0f/(power+1.0f));//(power+2)/(power+1);
+
+    return normalize(direction);
+}
+
+// random normalized vector
+vec3 UniformHemisphere(float seed, vec3 pixelSeed)
+{
+   float u = random(vec3(12.9898, 78.233, 151.7182), seed, pixelSeed);
+   float v = random(vec3(63.7264, 10.873, 623.6736), seed, pixelSeed);
+   float z = 1.0 - 2.0 * u;
+   float r = sqrt(1.0 - z * z);
+   float theta = 6.283185307179586 * v;
+   return vec3(r * cos(theta), r * sin(theta), z) * sqrt(random(vec3(36.7539, 50.3658, 306.2759), seed, pixelSeed));
+}
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------- Shading Functions ---------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+vec3 computeDiffuse(vec3 point, vec3 normal, Light light)
+{
+	 vec3 diffuse              = clamp( vec3( dot( normalize(point + light.position), normal)  ), 0.0f, 1.0f );
+	 diffuse                   *= light.color;
+	 return diffuse;
+}
+
+// http://www.filmicworlds.com/2014/04/21/optimizing-ggx-shaders-with-dotlh/
+// GGX Shading model.
+float G1V(float dotNV, float k)
+{
+    return 1.0f / (dotNV*(1.0f-k)+k);
+}
+
+// Computes specular color.
+// http://www.filmicworlds.com/2014/04/21/optimizing-ggx-shaders-with-dotlh/
+// TODO: further optimize based on this article.
+// GGX specular shading model.
+// L = light dir.
+vec3 computeSpecular(Ray ray, Light light, vec3 point, vec3 normal, float roughness, float F0)
+{
+    if (dot(ray.direction, normal) < 0)
+	    return vec3(0);
+
+    vec3 LP = -normalize(point + light.position);
+
+    vec3 H = normalize(ray.direction - LP); // half vec
+
+	roughness += 0.05f; // make sure it's not 0, otherwise artifacts.
+    float alpha = roughness * roughness;
+
+    float dotNL = clamp(dot(normal, -LP), 0.0f, 1.0f);
+    float dotNV = clamp(dot(normal, ray.direction), 0.0f, 1.0f);
+    float dotNH = clamp(dot(normal, H), 0.0f, 1.0f);
+    float dotLH = clamp(dot(-LP, H), 0.0f, 1.0f);
+
+    float F, D, vis;
+
+    // D - GGX distribution
+    float alphaSqr = alpha*alpha;
+    float denom = (dotNH * dotNH) * (alphaSqr-1.0f) + 1.0f;
+    D = alphaSqr/(PI*denom*denom);
+
+	// D - Blinn
+	//D = pow(dotNH, 16);
+
+    // F - schlick fresnel
+	// with spherical gaussian approximation.
+    float dotLH5 = pow(1.0f-dotLH, 5);
+    F = F0 + (1.0f - F0) * pow(2, (-5.55473 * (dot(ray.direction, H)) - 6.98316) * (dot(ray.direction, H)));
+
+    // V - Schlick approximation of Smith solved with GGX
+    float k = alpha/2.0f;
+    vis = G1V(dotNL, k) * G1V(dotNV, k);
+
+	// Combine
+    float specularFactor = dotNL * D * F * vis;
+
+    return vec3(specularFactor);
+}
+
+// Compute light attenuation cofficient.
+// v = world vertex
+float computeAttenuation(Light light, vec3 v, float traveled)
+{
+    float distance = length(light.position + v) + traveled;
+    float attenuation = 2 / (light.constantAttenuation + light.linearAttenuation * distance
+                         + light.quadraticAttenuation * distance * distance);
+
+    attenuation = clamp(1.0 - distance/light.radius, 0.0, 1.0);
+   return attenuation;
+}
+
+// Compute schlick fresnel.
+// P = world position
+// E = camera eye position.
+// F0 = fresnel reflectance.
+float computeFresnel(vec3 P, vec3 E, vec3 N, float F0) 
+{
+	vec3 I = -normalize(P - E);
+	N = normalize(N);
+	float fresnel = F0 * pow(1 + dot(I, N), 5);
+    return 1.0f - fresnel;
+}
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------- Geometry Functions --------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+//
+//
+//
+//
+bool intersectSphere(Ray ray, Sphere sphere, inout Intersection intersection)
+{
+    vec3 oc		= ray.origin + sphere.position.xyz;
+    float b		= 2.0 * dot(ray.direction, oc);
+    float c		= dot(oc, oc) - sphere.position.w * sphere.position.w;
+    float disc	= b * b - 4.0 * c;
+
+    if (disc < 0.0)
+        return false;
+
+    float q;
+    if (b < 0.0)
+        q = (-b - sqrt(disc))/2.0;
+    else
+        q = (-b + sqrt(disc))/2.0;
+
+    float t0 = q;
+    float t1 = c / q;
+
+	// if t0 is bigger than t1 swap them around
+    if (t0 > t1) 
+	{    
+        float temp = t0;
+        t0 = t1;
+        t1 = temp;
+    }
+
+    // if t1 is less than zero, the object is in the ray's negative direction
+    // and consequently the ray misses the sphere
+    if (t1 < 0.0)
+        return false;
+
+    // store intersection data
+    t0 < 0.0 ? intersection.range = t1 : intersection.range = t0;
+	intersection.point       = ray.origin + ray.direction * intersection.range;
+	intersection.normal      = -normalize(sphere.position.xyz + intersection.point);
+	intersection.reflection  = reflect( ray.direction, intersection.normal );
+
+	vec3 invertedNormal       = dot(ray.direction, intersection.normal) <= 0 ? intersection.normal : -intersection.normal;
+    intersection.refraction   = normalize(refract(ray.direction, invertedNormal, REFRACTION_ETA));
+
+	intersection.type         = sphere.specular.a > 0 ? REFLECTIVE : sphere.albedo.a < 1.0f ? TRANSLUCENT : SOLID;
+    intersection.albedo       = sphere.albedo;
+	intersection.specular     = sphere.specular;
+    intersection.redf         = sphere.redf;
+
+	return true;
+}
+
+
+//
+//
+//
+//
+
+bool intersectPlane(Ray ray, Plane plane, inout Intersection intersection)
+{
+   float d = -dot(-plane.position.xyz, plane.normal.xyz);
+   float v = dot(ray.direction, plane.normal.xyz);
+   float t = -(dot(ray.origin, plane.normal.xyz) + d) / v;
+
+   if(t > 0.0)
+   {
+      intersection.range		= t;
+      intersection.point		= ray.origin + ray.direction * t;
+      intersection.normal		= plane.normal.xyz; 
+      intersection.reflection	= reflect( ray.direction, plane.normal.xyz ); 
+
+	  vec3 invertedNormal       = dot(ray.direction, intersection.normal) <= 0 ? intersection.normal : -intersection.normal;
+      intersection.refraction    = normalize(refract(ray.direction, invertedNormal, REFRACTION_ETA));
+
+	  intersection.type         = plane.specular.a > 0 ? REFLECTIVE : plane.albedo.a < 1.0f ? TRANSLUCENT : SOLID;
+	  intersection.albedo       = plane.albedo;
+	  intersection.specular     = plane.specular;
+      intersection.redf         = plane.redf;
+      return true;
+   }
+
+   return false;
+}
+
+/*
+var intersectCubeSource =
+' vec2 intersectCube(vec3 origin, vec3 ray, vec3 cubeMin, vec3 cubeMax) {' +
+'   vec3 tMin = (cubeMin - origin) / ray;' +
+'   vec3 tMax = (cubeMax - origin) / ray;' +
+'   vec3 t1 = min(tMin, tMax);' +
+'   vec3 t2 = max(tMin, tMax);' +
+'   float tNear = max(max(t1.x, t1.y), t1.z);' +
+'   float tFar = min(min(t2.x, t2.y), t2.z);' +
+'   return vec2(tNear, tFar);' +
+' }';
+*/
+
+//
+//
+//
+//
+
+// Intersects all the geometry in the scene.
+bool Intersect(Ray ray, Light light, out Intersection intersection)
+{
+    Intersection closestIntersection;
+    int intersectionCount = 0;
+
+	// intersect plane
+	for (int p = 0; p < PLANE_COUNT; p++)
+	{
+	    Plane plane;
+	    plane.position   = _planes.planes[p].position;
+		plane.normal     = _planes.planes[p].normal;
+		plane.albedo     = _planes.planes[p].albedo;
+		plane.specular   = _planes.planes[p].specular;
+		plane.redf       = _planes.planes[p].redf;
+
+		Intersection ipp;
+		if ( intersectPlane(ray, plane, ipp) )
+		{
+			if (intersectionCount == 0)								closestIntersection = ipp;
+			else if (closestIntersection.range > ipp.range)			closestIntersection = ipp;
+
+            intersectionCount++;
+		}
+	}
+	
+    // intersect sphere.
+	for (int s = 0; s < SPHERE_COUNT; s++)
+	{
+	    Sphere sphere;
+	    sphere.position   = _spheres.spheres[s].position;
+		sphere.albedo     = _spheres.spheres[s].albedo;
+		sphere.specular   = _spheres.spheres[s].specular;
+		sphere.redf       = _spheres.spheres[s].redf;
+
+		Intersection ips;
+		if ( intersectSphere(ray, sphere, ips) )
+		{
+            if (intersectionCount == 0)								closestIntersection = ips;
+			else if (closestIntersection.range > ips.range)			closestIntersection = ips;
+
+            intersectionCount++;
+		}
+	}
+	
+    // return the data
+    intersection = closestIntersection;
+
+    if (intersectionCount > 0)
+         return true;
+    return false;
+}
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------- Material Functions ------------------------------------------------ //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+//
+//
+//
+//
+bool Reflection(Intersection intersection, Light light, vec3 pixelSeed, out Ray ray, out Intersection bounce)
+{
+    vec3 outputColor = vec3(0);
+
+	/*if (intersection.redf.r > 0.0f)
+		ray.direction    = normalize(intersection.reflection * (1.0f - intersection.redf.r) + normalize(CosineDirection(data.frame, -intersection.reflection, pixelSeed)) * intersection.redf.r );
+    else */ray.direction    = normalize(intersection.reflection);
+		
+	ray.origin       = intersection.point + ray.direction * BIAS;
+
+    bool occluded    = Intersect(ray, light, bounce);
+
+    return occluded;
+}
+
+
+//
+//
+//
+//
+bool Refraction(inout Ray ray, Intersection intersection, Light light, out Intersection refractedIntersection, vec3 pixelSeed)
+{
+    Intersection bounceIn;
+
+	vec3 invertedNormal = dot(ray.direction, intersection.normal) <= 0 ? intersection.normal : -intersection.normal;
+    ray.direction       = normalize(refract(ray.direction, invertedNormal, REFRACTION_ETA));
+	ray.origin          = intersection.point + ray.direction * BIAS;
+
+    bool occluded       = Intersect(ray, light, bounceIn);
+
+	refractedIntersection   = bounceIn;
+
+	return occluded;
+}
+
+
+//
+//
+//
+vec3 ShadowedLightning(Ray cameraRay, Ray ray, Intersection intersection, Light light, vec3 pixelSeed, float traveled, bool direct)
+{
+    vec3 outputColor = vec3(0);
+
+	// create occlusion ray
+    Intersection bounce;
+    Ray rayOcclusion;
+	rayOcclusion.direction    = -normalize(intersection.point + light.position);
+    rayOcclusion.origin       = intersection.point + rayOcclusion.direction * BIAS;
+
+    // travel through translucent nd reflective objects.
+	Intersection previous = intersection;
+	Ray previousOcclusion = ray;
+    bool occluded = Intersect(rayOcclusion, light, bounce);
+	int count = 0;
+	float refractionTraveled = 0;
+    while (occluded && count < MAX_BOUNCE_PER_TRACE && direct)
+	{
+		vec3 lastPoint = bounce.point;
+		if (length(previous.point + light.position) < bounce.range)
+		    break;
+
+		previousOcclusion = rayOcclusion;
+	    previous = bounce;
+
+	    /*if (bounce.type == REFLECTIVE)
+		{
+		    break;
+		    //occluded = Reflection(bounce, light, pixelSeed, rayOcclusion, bounce);
+			//vec3 currentPoint = bounce.point;
+		}
+		else */if (bounce.albedo.a < 1.0f)
+		{
+		    occluded = Refraction(rayOcclusion, bounce, light, bounce, pixelSeed) ;
+			vec3 currentPoint = bounce.point;
+		    refractionTraveled += length(lastPoint - currentPoint);
+		}
+		else
+		{
+		    break;
+		}    
+
+		count++;
+	}
+
+    // direct shadow
+    if (!occluded || length(previous.point + light.position) < bounce.range)
+	{
+	    float attenuation    = computeAttenuation(light, intersection.point, 0);
+
+        // diffuse
+	    outputColor      = computeDiffuse(intersection.point, intersection.normal, light) * intersection.albedo.rgb * attenuation;// * (!direct ? INDIRECT_DIFFUSE_INTENSITY : 1.0f);
+    
+		// speculr
+		if (count == 0 && direct)
+		{
+		    attenuation    = computeAttenuation(light, intersection.point, 0);
+		    outputColor    += clamp( computeSpecular(ray, light, intersection.point, intersection.normal, intersection.redf.r, 0.9f) * intersection.albedo.rgb * attenuation, 0.0f, 1.0f);
+		}
+		
+	    // refracted specular - CAUSTICS
+		if (count > 0 && CAUSTICS && direct)
+		{
+		     //float d        = clamp( dot(previousIntersection.normal, -previousOcclusion.direction), 0.0f, 1.0f );
+			 attenuation    = computeAttenuation(light, intersection.point, 0 + refractionTraveled);// * d;
+			 previousOcclusion.direction *= -1;
+		     outputColor     += computeSpecular(previousOcclusion, light, previous.point, previous.normal, previous.redf.r, 0.9f) * previous.albedo.rgb * attenuation;// * (!direct ? INDIRECT_CAUSTICS_INTENSITY : 1.0f), 0.0f, 16.0f);
+		}
+	}
+
+	// emission
+	if (bounce.redf.g > 0)
+		outputColor += bounce.redf.g * bounce.albedo.rgb;
+
+	return outputColor;
+}
+
+
+
+
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ---------------------------------------------------- Tracing Functions ---------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+
+//
+// Performs 1st bounce
+//
+vec3 TraceScene(Ray ray, Light light, vec3 pixelSeed)
+{
+    vec3 outputColor = vec3(0, 0, 0);
+
+	Ray cameraRay = ray;
+
+	Intersection intersection;
+    bool intersected = Intersect(ray, light, intersection);
+	//float traveled = 0;
+	int count = 0;
+	while (intersected && count < MAX_BOUNCE_PER_TRACE)
+	{
+	    if (intersection.redf.r == 0.0f)
+		{
+		    outputColor += ShadowedLightning(cameraRay, ray, intersection, light, pixelSeed, 0, true);
+			intersected = Reflection(intersection, light, pixelSeed, ray, intersection);
+		}
+		else if (intersection.albedo.a < 1.0f) // todo: roughness
+		{
+		    outputColor += ShadowedLightning(cameraRay, ray, intersection, light, pixelSeed, 0, true);
+		    intersected = Refraction(ray, intersection, light, intersection, pixelSeed);
+		}
+		else
+		{
+		    break;
+		}
+
+		count++;
+	}
+
+    // notice: could use IBL here when not intersected
+	if (intersected)
+	{
+	    // emission
+	    if (intersection.redf.g > 0)
+			outputColor += intersection.redf.g * intersection.albedo.rgb;
+
+	    // distribute light displacemen
+	    vec3 originalLightPosition = light.position;
+	    /*vec3 lightDisplacements[RAY_COUNT];
+		for (int d = 0; d < RAY_COUNT; d++)
+		{
+		    vec3 lightDisplacement  = UniformHemisphere(data.frame * RAY_COUNT + c, pixelSeed);
+		    lightDisplacements[d]   += lightDisplacement * 0.1f;
+		}*/
+
+	    // take multiple samples of direct shadowed light
+		// 1 sample per frame is not enough.
+        for (int c = 0; c < RAY_COUNT; c++)
+		{
+		    // displace light position
+	        vec3 lightDisplacement  = UniformHemisphere(data.frame * RAY_COUNT + c, pixelSeed);
+		    light.position          = originalLightPosition + lightDisplacement * 0.1f;
+ 
+	        // direct illumination
+	        outputColor += ShadowedLightning(cameraRay, ray, intersection, light, pixelSeed, 0, true) / RAY_COUNT;
+		}
+
+		// take multiple samples of indirect shadowed light
+		// 1 sample per frame is not enough.
+		// indirect illumination
+		if (BOUNCE_COUNT > 1)
+		{
+		    Ray rayBounceDirection;
+		    for (int i = 0; i < RAY_COUNT; i++)
+		    {
+			     // calc cosine direction & surface roughness
+				 float pdf;
+                 rayBounceDirection.direction = CosineDirection(data.frame * RAY_COUNT + i, -intersection.normal, pixelSeed, intersection, pdf);
+			     rayBounceDirection.origin    = intersection.point + rayBounceDirection.direction * BIAS;
+
+				 // displace light position
+	             vec3 lightDisplacement = UniformHemisphere(data.frame * RAY_COUNT + i, pixelSeed);
+		         light.position = originalLightPosition + lightDisplacement * 0.1f;
+
+				 //float PDF = dot(intersection.normal, rayBounceDirection.direction) / PI;
+ 
+				 // intersect scene & accum illuminted color
+                 bool intersected = Intersect(rayBounceDirection, light, intersection);
+				 if (intersected)
+				     outputColor += ShadowedLightning(cameraRay, rayBounceDirection, intersection, light, pixelSeed, 0, false);// * pdf;// / pdf;// * INDIRECT_INTENSITY / RAY_COUNT;
+		    }
+		}
+    }
+	
+	return outputColor;
+}
+ 
+ 
+
+
+// --------------------------------------------------------------------------------------------------------------------- //
+// ------------------------------------------------------ Scene -------------------------------------------------------- //
+// --------------------------------------------------------------------------------------------------------------------- //
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+void main()
+{
+    ivec2 uv            = ivec2( gl_GlobalInvocationID.xy );
+	vec2  normUV        = uv / data.resolution;
+	vec2  halfTexel     = normUV * 0.5f;
+
+	// AA - subcell jitter
+	float u = random(vec3(12.9898, 78.233, 151.7182), data.frame, vec3(normUV, 1)) * 2.0f - 1.0f;
+    float v = random(vec3(63.7264, 10.873, 623.6736), data.frame, vec3(normUV, 1)) * 2.0f - 1.0f;
+	vec2  subCellJitteredUV = normUV + vec2(u, v) / data.resolution / 2.0f;
+
+	// construct a ray
+    // todo: use only 1 transform
+	vec3 nearPos        = screenToWorld( data.inverse_projection_view, vec3(subCellJitteredUV, 0.0f) );
+	vec3 farPos         = screenToWorld( data.inverse_projection_view, vec3(subCellJitteredUV, 1.0f) );
+
+	Ray ray;
+	ray.origin          = nearPos;
+	ray.direction       = normalize( farPos - nearPos );
+
+	// create spot light
+	Light light;
+	light.type                  = _light.type;
+	light.position              = _light.position.xyz;
+	light.direction             = _light.direction.xyz;
+	light.color                 = _light.color.rgb;
+	light.constantAttenuation   = _light.constantAttenuation;
+	light.linearAttenuation     = _light.linearAttenuation;
+    light.quadraticAttenuation  = _light.quadraticAttenuation;
+	light.radius                = _light.radius;
+
+	if (data.frame == 0)
+	{
+	    // pth trce
+	    vec3 color         = TraceScene(ray, light, vec3(subCellJitteredUV, 1));
+
+	    imageStore(resultImage, uv, vec4(color, 1)); // curent 
+		imageStore(inputImage, uv, vec4(color, 1)); // previous
+	}
+	else if (data.frame < FRAME_COUNT)
+	{
+	    // pth trce
+	    vec3 color          = TraceScene(ray, light, vec3(subCellJitteredUV, 1));
+
+	    vec4 lastFrame      = imageLoad(inputImage, uv);
+
+		float sW			= 1.0f / (1.0f + data.frame * FRAME_PROGRESSION);
+		float sWI			= 1.0 - sW; 
+		vec4 newFrame		= lastFrame * sWI + vec4(max(vec3(0), color), 1.0f) * sW;
+
+		imageStore(resultImage, uv, newFrame);
+		imageStore(inputImage, uv, newFrame);
+	}
+}

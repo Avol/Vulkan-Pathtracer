@@ -1,0 +1,15 @@
+﻿  Window.cpp
+e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\window.cpp(153): error C2440: '=': cannot convert from 'nullptr' to 'VkSwapchainKHR'
+  e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\window.cpp(153): note: A native nullptr can only be converted to bool or, using reinterpret_cast, to an integral type
+  Texture.cpp
+  Shared.cpp
+  Renderer.cpp
+e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\renderer.cpp(409): error C2440: '=': cannot convert from 'nullptr' to 'VkDebugReportCallbackEXT'
+  e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\renderer.cpp(409): note: A native nullptr can only be converted to bool or, using reinterpret_cast, to an integral type
+  main.cpp
+  PathTracer.cpp
+  DataBuffer.cpp
+  Structs.cpp
+e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\base\helpers\structs.cpp(148): error C2440: '=': cannot convert from 'nullptr' to 'VkPipeline'
+  e:\megacloud\vulkan 0.05 compute shader\vulkan engine\vulkan engine\src\base\helpers\structs.cpp(148): note: A native nullptr can only be converted to bool or, using reinterpret_cast, to an integral type
+  Generating Code...
